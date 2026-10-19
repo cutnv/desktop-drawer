@@ -1,0 +1,33 @@
+# 本地配置、PIN 与个人数据不进入公开仓库。
+*.pin
+*.order
+item-order/
+system-icons.groups*
+*.log
+*.tmp
+*.bak
+*.clixml
+test-results/
+self-test*.txt
+
+# 开发工具与构建中间文件。
+.vs/
+.vscode/
+bin/
+obj/
+*.pdb
+*.user
+*.suo
+Thumbs.db
+Desktop.ini
+
+# 凭据与密钥。
+.env
+.env.*
+.git-credentials
+*.pem
+*.key
+*.pfx
+*.p12
+
+# DesktopDrawer.exe 有意纳入版本控制，便于误删后直接恢复运行。
