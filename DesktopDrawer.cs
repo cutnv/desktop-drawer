@@ -242,6 +242,40 @@ namespace DesktopDrawer
             if (folder) Directory.Move(source, destination); else File.Move(source, destination);
             return destination;
         }
+        internal static void RemoveGroup(string category, string desktop, string root)
+        {
+            category = Full(category); desktop = Full(desktop); root = Full(root);
+            string parent = Path.GetDirectoryName(category);
+            if (parent == null || !Same(parent, root) || Same(category, desktop) || Same(category, root) || !Directory.Exists(category) || !Directory.Exists(desktop))
+                throw new IOException("只能删除分类总目录内的单个分类，不能删除“待整理”或桌面。");
+            if ((File.GetAttributes(category) & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("此分类是链接或云端占位文件夹，请先在文件资源管理器中处理。");
+            string[] entries = Directory.GetFileSystemEntries(category).OrderBy(path => path, StringComparer.OrdinalIgnoreCase).ToArray();
+            foreach (string path in entries)
+            {
+                string destination = Path.Combine(desktop, Path.GetFileName(path));
+                if (File.Exists(destination) || Directory.Exists(destination))
+                    throw new IOException("“待整理”中已有同名项目，分类未删除、文件未移动：" + Path.GetFileName(path) + "\n请先重命名或移走同名项目，再重试。");
+            }
+            var moved = new List<string>();
+            try
+            {
+                foreach (string path in entries) moved.Add(Move(path, desktop));
+                // Never recurse: a newly created or locked item must keep the category intact.
+                Directory.Delete(category, false);
+            }
+            catch (Exception ex)
+            {
+                bool restored = true;
+                foreach (string path in moved.AsEnumerable().Reverse())
+                {
+                    try { Move(path, category); }
+                    catch (Exception rollback) { restored = false; Program.Log(rollback); }
+                }
+                throw new IOException(restored ? "分类未删除，已移动的文件已撤回。\n" + ex.Message
+                    : "分类未删除，部分项目已移回“待整理”，请检查这两个位置；未覆盖任何同名文件。\n" + ex.Message, ex);
+            }
+        }
         internal static string[] DeletionPaths(IEnumerable<string> paths, IEnumerable<string> allowedParents, IEnumerable<string> protectedPaths)
         {
             string[] roots = allowedParents.Select(Full).ToArray();
@@ -378,6 +412,13 @@ namespace DesktopDrawer
             if (saved.Contains(oldPath, StringComparer.OrdinalIgnoreCase))
                 Write(category, saved.Select(path => String.Equals(path, oldPath, StringComparison.OrdinalIgnoreCase) ? newPath : path));
         }
+        internal void RemoveCategory(string category, string root)
+        {
+            List<string> saved = Read(root);
+            if (saved.Contains(category, StringComparer.OrdinalIgnoreCase))
+                Write(root, saved.Where(path => !Files.Same(path, category)));
+            Write(category, new string[0]);
+        }
     }
 
     internal sealed class VirtualCategories
@@ -433,6 +474,11 @@ namespace DesktopDrawer
             if (!categories.Values.Any(path => Files.Same(path, oldPath))) return;
             Save(categories.ToDictionary(item => item.Key, item => Files.Same(item.Value, oldPath) ? Files.Full(newPath) : item.Value, StringComparer.OrdinalIgnoreCase));
         }
+        internal void RemoveCategory(string category)
+        {
+            if (categories.Values.Any(path => Files.Same(path, category)))
+                Save(categories.Where(item => !Files.Same(item.Value, category)).ToDictionary(item => item.Key, item => item.Value, StringComparer.OrdinalIgnoreCase));
+        }
         private void Save(Dictionary<string, string> updated)
         {
             // ponytail: Windows folder paths cannot contain tabs or newlines.
@@ -471,6 +517,9 @@ namespace DesktopDrawer
         private readonly DispatcherTimer usageTimer;
         private readonly DesktopPin desktopPin = new DesktopPin(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DesktopDrawer", "desktop-lock.pin"));
         private readonly DesktopLock desktopLock;
+        private readonly NotesController notes;
+        private readonly ToggleButton notesButton;
+        private readonly AdornerDecorator fileHost;
         private bool desktopLockStarting;
         private readonly SystemUsage systemUsage = new SystemUsage();
         private readonly TextBlock usageText;
@@ -562,7 +611,8 @@ namespace DesktopDrawer
             </Style>");
 
             desktopLock = new DesktopLock(roundedButtonStyle, Dispatcher, desktopPin);
-            desktopLock.Unlocked += delegate { lastInside = DateTime.UtcNow; edgeSince = DateTime.MaxValue; };
+            desktopLock.Locking += delegate { if (notes != null) notes.SetSuspended(true); };
+            desktopLock.Unlocked += delegate { lastInside = DateTime.UtcNow; edgeSince = DateTime.MaxValue; if (!closing && notes != null) notes.SetSuspended(false); };
             var layout = new DockPanel { LastChildFill = true, Margin = new Thickness(22, 18, 22, 14) };
             body = new Border { Background = new SolidColorBrush(Color.FromArgb(224, 24, 27, 33)), BorderBrush = new SolidColorBrush(Color.FromArgb(130, 85, 94, 110)), BorderThickness = new Thickness(0, 0, 0, 1), Child = layout, RenderTransform = slide };
             Content = new Border { Background = Brushes.Transparent, Child = body, ClipToBounds = true };
@@ -570,13 +620,14 @@ namespace DesktopDrawer
             DockPanel.SetDock(header, Dock.Top); layout.Children.Add(header);
             var controls = new StackPanel { Orientation = Orientation.Horizontal };
             DockPanel.SetDock(controls, Dock.Right); header.Children.Add(controls);
+            notesButton = new ToggleButton { Style = roundedToggleStyle, Content = "便签", Padding = new Thickness(11,5,11,5), Margin = new Thickness(8,0,0,0) };
+            System.Windows.Automation.AutomationProperties.SetName(notesButton,"便签"); controls.Children.Add(notesButton);
             pinned = new ToggleButton { Style = roundedToggleStyle, Content = "保持展开", Padding = new Thickness(11, 5, 11, 5), Margin = new Thickness(8, 0, 0, 0) };
             controls.Children.Add(pinned);
             var add = Button("＋ 新建分类", delegate { CreateGroup(); }); add.AutomationName("新建分类"); controls.Children.Add(add);
-            var lockButton = Button("桌面锁", delegate { BeginDesktopLock(); }); lockButton.AutomationName("桌面锁"); lockButton.ToolTip = "手动开启桌面锁，使用独立的 6 位 PIN 在桌面内解锁"; controls.Children.Add(lockButton);
             search = new TextBox { Style = inputStyle, Width = 175, TextAlignment = TextAlignment.Center, Padding = new Thickness(10, 0, 10, 0), ToolTip = "全局搜索：全部分类与待整理", Margin = new Thickness(12, 0, 0, 0) };
             System.Windows.Automation.AutomationProperties.SetName(search, "查找文件");
-            search.TextChanged += delegate { dirty = true; }; controls.Children.Insert(0, search);
+            search.TextChanged += delegate { if (notes != null && notesButton.IsChecked == true) notes.SetQuery(search.Text); else dirty = true; }; controls.Children.Insert(0, search);
             tabs = new StackPanel { Orientation = Orientation.Horizontal };
             tabScroll = new ScrollViewer { Content = tabs, HorizontalScrollBarVisibility = ScrollBarVisibility.Hidden, VerticalScrollBarVisibility = ScrollBarVisibility.Disabled, AllowDrop = true };
             tabScroll.SizeChanged += delegate { ScrollSelectedTabIntoView(); };
@@ -587,6 +638,37 @@ namespace DesktopDrawer
             var tabDecorator = new AdornerDecorator { Child = tabScroll };
             header.Children.Add(tabDecorator);
             list = new ListBox { Foreground = Foreground, FocusVisualStyle = null, Background = Brushes.Transparent, BorderThickness = new Thickness(0), SelectionMode = SelectionMode.Extended, AllowDrop = true, Padding = new Thickness(0) };
+            list.Resources[SystemParameters.VerticalScrollBarWidthKey] = 8.0;
+            list.Resources[typeof(ScrollBar)] = (Style)XamlReader.Parse(@"<Style xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' TargetType='{x:Type ScrollBar}'>
+                <Setter Property='Width' Value='8'/><Setter Property='MinWidth' Value='8'/><Setter Property='Focusable' Value='False'/>
+                <Setter Property='Template'><Setter.Value><ControlTemplate TargetType='{x:Type ScrollBar}'>
+                    <Border Background='#20252D' CornerRadius='4' SnapsToDevicePixels='True'>
+                        <Track x:Name='PART_Track' Orientation='{TemplateBinding Orientation}' IsDirectionReversed='True'
+                            Minimum='{TemplateBinding Minimum}' Maximum='{TemplateBinding Maximum}' ViewportSize='{TemplateBinding ViewportSize}'
+                            Value='{Binding Value, RelativeSource={RelativeSource TemplatedParent}, Mode=TwoWay}'>
+                            <Track.DecreaseRepeatButton><RepeatButton x:Name='DecreasePage' Command='{x:Static ScrollBar.PageUpCommand}' Opacity='0' Focusable='False'/></Track.DecreaseRepeatButton>
+                            <Track.Thumb><Thumb x:Name='GripThumb' MinHeight='24' Background='#4E5766'>
+                                <Thumb.Template><ControlTemplate TargetType='{x:Type Thumb}'>
+                                    <Border x:Name='Grip' Background='{TemplateBinding Background}' CornerRadius='3' Margin='1,0'/>
+                                    <ControlTemplate.Triggers>
+                                        <DataTrigger Binding='{Binding Orientation, RelativeSource={RelativeSource AncestorType={x:Type ScrollBar}}}' Value='Horizontal'><Setter TargetName='Grip' Property='Margin' Value='0,1'/></DataTrigger>
+                                        <Trigger Property='IsMouseOver' Value='True'><Setter TargetName='Grip' Property='Background' Value='#697587'/></Trigger>
+                                        <Trigger Property='IsDragging' Value='True'><Setter TargetName='Grip' Property='Background' Value='#8493A8'/></Trigger>
+                                    </ControlTemplate.Triggers>
+                                </ControlTemplate></Thumb.Template>
+                            </Thumb></Track.Thumb>
+                            <Track.IncreaseRepeatButton><RepeatButton x:Name='IncreasePage' Command='{x:Static ScrollBar.PageDownCommand}' Opacity='0' Focusable='False'/></Track.IncreaseRepeatButton>
+                        </Track>
+                    </Border>
+                    <ControlTemplate.Triggers><Trigger Property='Orientation' Value='Horizontal'>
+                        <Setter TargetName='PART_Track' Property='IsDirectionReversed' Value='False'/>
+                        <Setter TargetName='GripThumb' Property='MinHeight' Value='0'/><Setter TargetName='GripThumb' Property='MinWidth' Value='24'/>
+                        <Setter TargetName='DecreasePage' Property='Command' Value='{x:Static ScrollBar.PageLeftCommand}'/>
+                        <Setter TargetName='IncreasePage' Property='Command' Value='{x:Static ScrollBar.PageRightCommand}'/>
+                    </Trigger></ControlTemplate.Triggers>
+                </ControlTemplate></Setter.Value></Setter>
+                <Style.Triggers><Trigger Property='Orientation' Value='Horizontal'><Setter Property='Width' Value='Auto'/><Setter Property='MinWidth' Value='0'/><Setter Property='Height' Value='8'/><Setter Property='MinHeight' Value='8'/></Trigger></Style.Triggers>
+            </Style>");
             list.ItemContainerStyle = (Style)XamlReader.Parse(@"<Style xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' TargetType='{x:Type ListBoxItem}'>
                 <Setter Property='Padding' Value='4,2'/><Setter Property='Background' Value='Transparent'/><Setter Property='BorderBrush' Value='Transparent'/><Setter Property='BorderThickness' Value='1'/>
                 <Setter Property='Foreground' Value='#EDF1F7'/><Setter Property='FocusVisualStyle' Value='{x:Null}'/>
@@ -632,10 +714,21 @@ namespace DesktopDrawer
                 if (e.Key == Key.Enter && !shellBusy && !interacting && !deleting)
                 { e.Handled = true; foreach (Entry item in list.SelectedItems.Cast<Entry>().ToArray()) Open(item); }
             };
-            usageText = new TextBlock { FontSize = 12, Foreground = new SolidColorBrush(Color.FromRgb(170, 180, 195)), HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 6, 0, 0), ToolTip = "整台电脑的 CPU 与物理内存占用，每秒刷新" };
+            var footer = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 6, 0, 0) };
+            usageText = new TextBlock { FontSize = 12, Foreground = new SolidColorBrush(Color.FromRgb(170, 180, 195)), VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 8, 0), ToolTip = "整台电脑的 CPU 与物理内存占用，每秒刷新" };
             System.Windows.Automation.AutomationProperties.SetAutomationId(usageText, "SystemUsage");
-            DockPanel.SetDock(usageText, Dock.Bottom); layout.Children.Add(usageText);
-            layout.Children.Add(new AdornerDecorator { Child = list });
+            footer.Children.Add(usageText);
+            var taskManager = Button("任务管理器", delegate { OpenSystemTool("Taskmgr.exe"); }); taskManager.AutomationName("任务管理器"); footer.Children.Add(taskManager);
+            var deviceManager = Button("设备管理器", delegate { OpenSystemTool("devmgmt.msc"); }); deviceManager.AutomationName("设备管理器"); footer.Children.Add(deviceManager);
+            var lockButton = Button("桌面锁", delegate { BeginDesktopLock(); }); lockButton.AutomationName("桌面锁"); lockButton.ToolTip = "手动开启桌面锁，使用独立的 6 位 PIN 在桌面内解锁"; footer.Children.Add(lockButton);
+            DockPanel.SetDock(footer, Dock.Bottom); layout.Children.Add(footer);
+            fileHost = new AdornerDecorator { Child = list };
+            notes = new NotesController(this,roundedButtonStyle,inputStyle,(Style)list.Resources[typeof(ScrollBar)],
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"DesktopDrawer","notes-data"));
+            notes.BusyChanged += delegate(bool value) { interacting = value; lastInside = DateTime.UtcNow; };
+            notes.ResetSearch += delegate { search.Clear(); };
+            var content = new Grid(); content.Children.Add(fileHost); content.Children.Add(notes.View); layout.Children.Add(content);
+            notesButton.Checked += delegate { ShowNotes(true); }; notesButton.Unchecked += delegate { ShowNotes(false); };
             PreviewKeyDown += DesktopKeyDown;
             handle = new WindowInteropHelper(this).EnsureHandle();
             HwndSource.FromHwnd(handle).AddHook(WindowMessage);
@@ -663,6 +756,9 @@ namespace DesktopDrawer
             usageTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
             usageTimer.Tick += delegate { usageText.Text = systemUsage.Read(); }; usageTimer.Start();
             Closed += delegate { Cleanup(); };
+            Closing += delegate(object sender, System.ComponentModel.CancelEventArgs e) {
+                if (!notes.Flush() && MessageBox.Show(this,"便签尚未保存成功，退出可能丢失最新输入。仍要退出？","便签保存失败",MessageBoxButton.YesNo,MessageBoxImage.Warning,MessageBoxResult.No) != MessageBoxResult.Yes) e.Cancel = true;
+            };
             AppDomain.CurrentDomain.ProcessExit += delegate { Native.SetDesktopVisible(originalIconsVisible); };
         }
 
@@ -670,6 +766,15 @@ namespace DesktopDrawer
         {
             var button = new Button { Style = roundedButtonStyle, Content = text, Padding = new Thickness(11, 5, 11, 5), Margin = new Thickness(8, 0, 0, 0), Cursor = Cursors.Hand };
             button.Click += click; return button;
+        }
+        private void ShowNotes(bool visible)
+        {
+            notes.View.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
+            fileHost.Visibility = visible ? Visibility.Collapsed : Visibility.Visible;
+            search.ToolTip = visible ? "搜索便签标题与正文" : "全局搜索：全部分类与待整理";
+            search.Clear();
+            if (visible) { notes.SetQuery(""); RefreshTabs(); } else RefreshContent();
+            lastInside = DateTime.UtcNow;
         }
         private void BeginDesktopLock()
         {
@@ -702,6 +807,12 @@ namespace DesktopDrawer
             if (shellBusy || deleting || interacting) return;
             ModifierKeys modifiers = Keyboard.Modifiers;
             Key key = e.Key == Key.System ? e.SystemKey : e.Key;
+            if (notesButton.IsChecked == true)
+            {
+                if ((e.Key == Key.F || e.Key == Key.E) && modifiers == ModifierKeys.Control) { e.Handled = true; search.Focus(); search.SelectAll(); }
+                else if (e.Key == Key.Escape) { e.Handled = true; HideDrawer(); }
+                return;
+            }
             if (e.Key == Key.N && modifiers == (ModifierKeys.Control | ModifierKeys.Shift))
             { e.Handled = true; if (!e.IsRepeat) CreateFolder(); return; }
             if (e.Key == Key.F5 && modifiers == ModifierKeys.None)
@@ -804,11 +915,11 @@ namespace DesktopDrawer
         }
         private void AddTab(string name, string destination)
         {
-            bool selected = Files.Same(current, destination);
+            bool selected = notesButton.IsChecked != true && Files.Same(current, destination);
             var button = new Button { Style = roundedButtonStyle, Content = name, Tag = destination, ToolTip = "拖动调整分类顺序", Padding = new Thickness(15, 5, 15, 5), Margin = new Thickness(0, 0, 8, 0), AllowDrop = true, Cursor = Cursors.Hand,
                 Background = new SolidColorBrush(selected ? Color.FromRgb(245, 247, 250) : Color.FromRgb(43, 48, 58)), Foreground = selected ? new SolidColorBrush(Color.FromRgb(28, 33, 42)) : Foreground,
                 BorderBrush = new SolidColorBrush(selected ? Color.FromRgb(245, 247, 250) : Color.FromRgb(71, 79, 93)) };
-            button.Click += delegate { current = destination; search.Clear(); RefreshContent(); };
+            button.Click += delegate { notesButton.IsChecked = false; current = destination; search.Clear(); RefreshContent(); };
             button.PreviewMouseLeftButtonDown += delegate(object sender, MouseButtonEventArgs e) { tabDragSource = button; tabDragStart = e.GetPosition(button); };
             button.PreviewMouseLeftButtonUp += delegate { tabDragSource = null; };
             button.PreviewMouseMove += BeginTabDrag;
@@ -816,7 +927,11 @@ namespace DesktopDrawer
             button.Drop += delegate(object sender, DragEventArgs e) { DropFiles(e, destination, false); };
             var menu = new ContextMenu();
             menu.Items.Add(Menu("在文件资源管理器中打开", delegate { Start(destination); }));
-            if (!Files.Same(destination, desktop)) menu.Items.Add(Menu("重命名分类", delegate { RenameGroup(destination); }));
+            if (!Files.Same(destination, desktop))
+            {
+                menu.Items.Add(Menu("重命名分类", delegate { RenameGroup(destination); }));
+                menu.Items.Add(Menu("删除分类", delegate { DeleteGroup(destination); }));
+            }
             HoldMenu(menu); button.ContextMenu = menu; tabs.Children.Add(button);
         }
         private bool IsCategoryDrag(IDataObject data)
@@ -1260,6 +1375,26 @@ namespace DesktopDrawer
             catch (Exception ex) { Program.Log(ex); Alert("无法新建文件夹：" + ex.Message); }
             finally { shellBusy = previousBusy; lastInside = DateTime.UtcNow; }
         }
+        private void DeleteGroup(string path)
+        {
+            if (deleting || shellBusy || draggedEntries != null || draggedTab != null) return;
+            deleting = true;
+            try
+            {
+                string message = "删除分类“" + Path.GetFileName(path) + "”？\n\n其中的文件、文件夹和系统图标会移回“待整理”，不会删除文件。";
+                if (MessageBox.Show(this, message, "删除分类", MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No) != MessageBoxResult.Yes) return;
+                Files.RemoveGroup(path, desktop, groupsRoot);
+                current = desktop; search.Clear();
+                try { virtualCategories.RemoveCategory(path); itemOrder.RemoveCategory(path, groupsRoot); }
+                catch (Exception ex) { Program.Log(ex); Alert("分类已删除、文件已移回“待整理”，但部分分类记录未能清理：" + ex.Message); }
+            }
+            catch (Exception ex) { Program.Log(ex); Alert("无法删除分类：" + ex.Message); }
+            finally
+            {
+                try { ReloadContent(); } catch (Exception ex) { Program.Log(ex); }
+                deleting = false; lastInside = DateTime.UtcNow;
+            }
+        }
         private void RenameGroup(string path)
         {
             string name = AskName("重命名分类", Path.GetFileName(path)); if (name == null) return;
@@ -1278,6 +1413,11 @@ namespace DesktopDrawer
         {
             try { Start(item.Virtual ? "shell:" + item.Path : item.Path); if (pinned.IsChecked != true) HideDrawer(); }
             catch (Exception ex) { Alert("无法打开：" + ex.Message); }
+        }
+        private void OpenSystemTool(string file)
+        {
+            try { Start(Path.Combine(Environment.SystemDirectory, file)); if (pinned.IsChecked != true) HideDrawer(); }
+            catch (Exception ex) { Program.Log(ex); Alert("无法打开系统工具：" + ex.Message); }
         }
         private static void Start(string path) { Process.Start(new ProcessStartInfo(path) { UseShellExecute = true }); }
         private static void RevealInExplorer(string path) { Process.Start(new ProcessStartInfo("explorer.exe", "/select,\"" + path + "\"") { UseShellExecute = true }); }
@@ -1369,11 +1509,11 @@ namespace DesktopDrawer
                 bool inside = cursor.X >= rect.Left && cursor.X < rect.Right && cursor.Y >= rect.Top && cursor.Y < rect.Bottom;
                 if (hiding)
                 {
-                    if (allowHoverReopen && (inside || interacting || deleting || shellBusy || ownDialog || pinned.IsChecked == true)) AnimateSlide(true);
+                    if (allowHoverReopen && (inside || interacting || deleting || shellBusy || ownDialog || notes.IsEditing || pinned.IsChecked == true)) AnimateSlide(true);
                     return;
                 }
-                if (dirty && !interacting && !deleting && !shellBusy) { try { RefreshContent(); } catch (Exception ex) { Program.Log(ex); } }
-                if (inside || interacting || deleting || shellBusy || ownDialog || pinned.IsChecked == true) lastInside = now;
+                if (dirty && notesButton.IsChecked != true && !interacting && !deleting && !shellBusy) { try { RefreshContent(); } catch (Exception ex) { Program.Log(ex); } }
+                if (inside || interacting || deleting || shellBusy || ownDialog || notes.IsEditing || pinned.IsChecked == true) lastInside = now;
                 else if ((now - lastInside).TotalMilliseconds > 120) HideDrawer(true);
                 return;
             }
@@ -1462,6 +1602,7 @@ namespace DesktopDrawer
         internal void Cleanup()
         {
             if (closing) return; closing = true;
+            if (notes != null) notes.Dispose();
             if (desktopLock != null) desktopLock.Dispose();
             if (timer != null) timer.Stop();
             if (usageTimer != null) usageTimer.Stop();
@@ -1582,6 +1723,44 @@ namespace DesktopDrawer
                 foreach (string invalid in new[] { "..", "../escape", "CON", "COM1.txt", "x.", "", "待整理" })
                 { rejected = false; try { Files.GroupPath(target, invalid); } catch (IOException) { rejected = true; } Require(rejected, "invalid group " + invalid); }
                 Require(Files.Inside(Files.GroupPath(target, "工作"), target), "valid group"); checks.Add("分类名称及路径边界");
+                string groupDesktop = Path.Combine(root, "group-desktop"), groupRoot = Path.Combine(groupDesktop, "分类");
+                Directory.CreateDirectory(groupRoot);
+                string removedGroup = Path.Combine(groupRoot, "待删除"); Directory.CreateDirectory(removedGroup);
+                Files.RemoveGroup(removedGroup, groupDesktop, groupRoot);
+                Require(!Directory.Exists(removedGroup), "remove empty group");
+                Directory.CreateDirectory(Path.Combine(removedGroup, "nested"));
+                File.WriteAllText(Path.Combine(removedGroup, "nested", "data.txt"), "nested preserved");
+                File.WriteAllText(Path.Combine(removedGroup, "hidden.txt"), "hidden preserved");
+                File.SetAttributes(Path.Combine(removedGroup, "hidden.txt"), FileAttributes.Hidden);
+                Files.RemoveGroup(removedGroup, groupDesktop, groupRoot);
+                Require(!Directory.Exists(removedGroup) && File.ReadAllText(Path.Combine(groupDesktop, "nested", "data.txt")) == "nested preserved" &&
+                    File.ReadAllText(Path.Combine(groupDesktop, "hidden.txt")) == "hidden preserved" && (File.GetAttributes(Path.Combine(groupDesktop, "hidden.txt")) & FileAttributes.Hidden) != 0, "dissolve preserves nested and hidden files");
+                checks.Add("删除空分类及将完整文件夹、隐藏文件移回待整理");
+                Directory.CreateDirectory(removedGroup);
+                File.WriteAllText(Path.Combine(removedGroup, "a-free.txt"), "unchanged");
+                File.WriteAllText(Path.Combine(removedGroup, "z-conflict.txt"), "category version");
+                File.WriteAllText(Path.Combine(groupDesktop, "z-conflict.txt"), "desktop version");
+                rejected = false;
+                try { Files.RemoveGroup(removedGroup, groupDesktop, groupRoot); } catch (IOException) { rejected = true; }
+                Require(rejected && Directory.Exists(removedGroup) && File.ReadAllText(Path.Combine(removedGroup, "a-free.txt")) == "unchanged" &&
+                    !File.Exists(Path.Combine(groupDesktop, "a-free.txt")) && File.ReadAllText(Path.Combine(removedGroup, "z-conflict.txt")) == "category version" &&
+                    File.ReadAllText(Path.Combine(groupDesktop, "z-conflict.txt")) == "desktop version", "group collision moves nothing");
+                checks.Add("删除分类遇到同名冲突整批保留、双方不覆盖");
+                string lockedGroup = Path.Combine(groupRoot, "占用"); Directory.CreateDirectory(lockedGroup);
+                File.WriteAllText(Path.Combine(lockedGroup, "a-first.txt"), "rollback");
+                string busyFile = Path.Combine(lockedGroup, "z-busy.txt"); File.WriteAllText(busyFile, "busy");
+                rejected = false;
+                using (var held = new FileStream(busyFile, FileMode.Open, FileAccess.Read, FileShare.Read))
+                { try { Files.RemoveGroup(lockedGroup, groupDesktop, groupRoot); } catch (IOException) { rejected = true; } }
+                Require(rejected && Directory.Exists(lockedGroup) && File.ReadAllText(Path.Combine(lockedGroup, "a-first.txt")) == "rollback" &&
+                    !File.Exists(Path.Combine(groupDesktop, "a-first.txt")) && File.ReadAllText(busyFile) == "busy", "group failure rolls back earlier moves");
+                foreach (string invalid in new[] { groupDesktop, groupRoot, Path.Combine(lockedGroup, "nested"), source })
+                {
+                    rejected = false;
+                    try { Files.RemoveGroup(invalid, groupDesktop, groupRoot); } catch (IOException) { rejected = true; }
+                    Require(rejected, "reject group deletion outside direct child " + invalid);
+                }
+                checks.Add("删除分类占用失败撤回已移动文件、拒绝桌面与越界目录");
                 string child = Path.Combine(source, "child"); Directory.CreateDirectory(child); rejected = false;
                 try { Files.Move(source, child); } catch (IOException) { rejected = true; } Require(rejected && Directory.Exists(source), "reject recursive move"); checks.Add("拒绝移入自身子目录");
                 string folder = Path.Combine(source, "folder"); Directory.CreateDirectory(folder); File.WriteAllText(Path.Combine(folder, "nested.txt"), "nested"); string movedFolder = Files.Move(folder, target);
@@ -1637,6 +1816,11 @@ namespace DesktopDrawer
                 Require(new ItemOrder(orderDirectory).Apply(tabRoot, categoryTabs.Where(item => item != workTab), true).SequenceEqual(new[] { learnTab, pendingTab }), "removed category does not disturb others");
                 Require(new ItemOrder(orderDirectory).Apply(virtualCategory, withSystemIcon).First().Virtual, "tab order does not change file order");
                 checks.Add("分类拖动排序、重启、重命名、新增及删除分类后的顺序");
+                order.RemoveCategory(virtualCategory, tabRoot);
+                Require(!new ItemOrder(orderDirectory).Apply(virtualCategory, withSystemIcon).First().Virtual, "removed group file order is cleared");
+                order.RemoveCategory(learnTab.Path, tabRoot);
+                Require(new ItemOrder(orderDirectory).Apply(tabRoot, categoryTabs, true).Last() == learnTab, "recreated group appends instead of inheriting old tab position");
+                checks.Add("删除分类清理图标与标签排序，同名重建不复用旧位置");
                 string iconRoot = Path.Combine(root, "system-icon-groups"), iconGroup = Path.Combine(iconRoot, "系统");
                 Directory.CreateDirectory(iconGroup);
                 string iconRecord = Path.Combine(root, "system-icons.groups");
@@ -1655,6 +1839,12 @@ namespace DesktopDrawer
                 Directory.Delete(renamedIconGroup);
                 Require(systemIds.All(id => Files.Same(new VirtualCategories(iconRecord).CategoryFor(id, source, iconRoot), source)), "missing group returns icons to pending");
                 checks.Add("三个系统图标分类、移回待整理、重启、分类重命名及分类丢失回退");
+                string removedIconGroup = Path.Combine(iconRoot, "移除分类"); Directory.CreateDirectory(removedIconGroup);
+                iconGroups.Assign(systemIds, removedIconGroup, source, iconRoot);
+                Files.RemoveGroup(removedIconGroup, source, iconRoot); iconGroups.RemoveCategory(removedIconGroup);
+                Directory.CreateDirectory(removedIconGroup);
+                Require(systemIds.All(id => Files.Same(new VirtualCategories(iconRecord).CategoryFor(id, source, iconRoot), source)), "recreated group cannot recapture returned system icons");
+                checks.Add("删除分类后系统图标回待整理，重启及同名重建不回流");
                 string deleteParent = Path.Combine(root, "delete-check"); Directory.CreateDirectory(deleteParent);
                 string deleteFile = Path.Combine(deleteParent, "selected.txt"), unselected = Path.Combine(root, "unselected.txt");
                 File.WriteAllText(deleteFile, "selected"); File.WriteAllText(unselected, "unselected");

@@ -3,6 +3,8 @@
 *.order
 item-order/
 system-icons.groups*
+notes-data/
+*.note*
 *.log
 *.tmp
 *.bak

@@ -42,6 +42,9 @@ namespace DesktopDrawer
         private IntPtr keyboardHook, mouseHook, originalForeground;
         private Window unlockWindow;
         private Button unlockEntry;
+        private TextBlock unlockClock;
+        private Border clockBackground;
+        private const double UnlockWidth = 156;
         private object shell;
         private bool verifying, recovery, rebuilding, displayPending;
         private int failedAttempts;
@@ -61,6 +64,7 @@ namespace DesktopDrawer
         internal bool IsLocked { get; private set; }
         internal bool IsVerifying { get { return verifying; } }
         internal event Action Unlocked;
+        internal event Action Locking;
         internal static string RecoveryEventName(int processId) { return @"Local\DesktopDrawer.LockRecovery." + processId; }
 
         internal DesktopLock(Style style, Dispatcher ui, DesktopPin credential)
@@ -81,6 +85,7 @@ namespace DesktopDrawer
             try
             {
                 recoverySignal.Set();
+                if (Locking != null) Locking();
                 shell = Activator.CreateInstance(Type.GetTypeFromProgID("Shell.Application"));
                 ((dynamic)shell).MinimizeAll();
                 HideTaskbars();
@@ -143,10 +148,18 @@ namespace DesktopDrawer
         {
             var window = new Window { Title = "桌面解锁", WindowStyle = WindowStyle.None, ResizeMode = ResizeMode.NoResize,
                 AllowsTransparency = true, Background = new SolidColorBrush(Color.FromArgb(1, 0, 0, 0)),
-                Topmost = true, ShowInTaskbar = false, ShowActivated = false, Width = 72, Height = 28 };
+                Topmost = true, ShowInTaskbar = false, ShowActivated = false, Width = UnlockWidth, Height = 28 };
             var panel = new Grid(); window.Content = panel;
-            var entry = new Button { Style = buttonStyle, Content = "解锁", FontSize = 11, Height = 28,
+            var entry = new Button { Style = buttonStyle, Content = "解锁", FontSize = 11, Width = 72, Height = 28, HorizontalAlignment = HorizontalAlignment.Right,
                 Padding = new Thickness(10, 3, 10, 3), Opacity = 0.55, Cursor = Cursors.Hand, ToolTip = "解锁桌面" };
+            unlockClock = new TextBlock { FontFamily = entry.FontFamily, FontSize = entry.FontSize, Foreground = entry.Foreground,
+                TextAlignment = TextAlignment.Center, VerticalAlignment = VerticalAlignment.Center, IsHitTestVisible = false };
+            System.Windows.Automation.AutomationProperties.SetAutomationId(unlockClock, "DesktopLockClock");
+            clockBackground = new Border { Background = entry.Background, BorderBrush = entry.BorderBrush, BorderThickness = entry.BorderThickness,
+                CornerRadius = new CornerRadius(8), Width = 72, Height = 28, HorizontalAlignment = HorizontalAlignment.Left,
+                IsHitTestVisible = false, Child = unlockClock };
+            clockBackground.SetBinding(UIElement.OpacityProperty, new System.Windows.Data.Binding("Opacity") { Source = entry });
+            panel.Children.Add(clockBackground); UpdateClock();
             unlockEntry = entry; entry.AutomationName("解锁桌面");
             entry.MouseEnter += delegate { entry.Opacity = 0.95; };
             entry.MouseLeave += delegate { entry.Opacity = 0.55; };
@@ -178,7 +191,7 @@ namespace DesktopDrawer
             IntPtr handle = new WindowInteropHelper(unlockWindow).EnsureHandle();
             var bounds = Forms.Screen.PrimaryScreen.Bounds;
             double scale = Math.Max(96, Native.GetDpiForWindow(handle)) / 96.0;
-            int width = (int)Math.Round((expanded ? 300 : 72) * scale), height = (int)Math.Round((expanded ? 280 : 28) * scale);
+            int width = (int)Math.Round((expanded ? 300 : UnlockWidth) * scale), height = (int)Math.Round((expanded ? 280 : 28) * scale);
             int margin = (int)Math.Round(18 * scale);
             Native.SetWindowPos(handle, new IntPtr(-1), bounds.Right - margin - width, bounds.Bottom - margin - height, width, height, 0x10);
         }
@@ -186,14 +199,14 @@ namespace DesktopDrawer
         {
             if (!IsLocked || verifying || unlockWindow == null) return;
             PinView view = views[unlockWindow]; view.Input.Clear(); view.Card.Visibility = Visibility.Collapsed;
-            unlockEntry.Visibility = Visibility.Visible; PositionUnlockWindow(false);
+            unlockEntry.Visibility = Visibility.Visible; clockBackground.Visibility = Visibility.Visible; UpdateClock(); PositionUnlockWindow(false);
         }
         private void ShowPin(Window owner)
         {
             if (!IsLocked || verifying || unlockWindow == null) return;
             owner = unlockWindow;
             foreach (var pair in views) { pair.Value.Input.Clear(); pair.Value.Card.Visibility = pair.Key == owner ? Visibility.Visible : Visibility.Collapsed; }
-            unlockEntry.Visibility = Visibility.Collapsed; PositionUnlockWindow(true);
+            unlockEntry.Visibility = Visibility.Collapsed; clockBackground.Visibility = Visibility.Collapsed; PositionUnlockWindow(true);
             owner.Activate(); views[owner].Input.Focus();
         }
         private async void Verify(Window owner)
@@ -249,9 +262,14 @@ namespace DesktopDrawer
             if (!handles.Contains(GetAncestor(WindowFromPoint(point), 2))) return new IntPtr(1);
             return CallNextHookEx(mouseHook, code, message, data);
         }
+        private void UpdateClock()
+        {
+            if (unlockClock != null) unlockClock.Text = DateTime.Now.ToString("HH:mm:ss");
+        }
         private void Monitor(object sender, EventArgs e)
         {
             if (!IsLocked) return;
+            UpdateClock();
             IntPtr foreground = Native.GetForegroundWindow();
             var name = new StringBuilder(64); Native.GetClassName(foreground, name, name.Capacity);
             // Keep the OS Task Manager available as the explicitly accepted emergency recovery route.
@@ -297,7 +315,7 @@ namespace DesktopDrawer
             foreach (PinView view in views.Values) view.Input.Clear();
             foreach (Window window in windows) window.Close();
             windows.Clear(); handles.Clear(); views.Clear();
-            unlockWindow = null; unlockEntry = null;
+            unlockWindow = null; unlockEntry = null; unlockClock = null; clockBackground = null;
             foreach (IntPtr taskbar in hiddenTaskbars) if (Native.IsWindow(taskbar)) Native.ShowWindow(taskbar, 4);
             hiddenTaskbars.Clear();
             if (shell != null)
